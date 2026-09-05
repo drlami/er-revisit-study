@@ -1,0 +1,10 @@
+# Python — build_all.py sets dont_write_bytecode, but the helpers can still leave these
+__pycache__/
+*.pyc
+
+# Word / Excel lock files
+~$*
+
+# OS
+Thumbs.db
+.DS_Store

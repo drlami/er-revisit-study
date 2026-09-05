@@ -1,0 +1,428 @@
+# -*- coding: utf-8 -*-
+"""Build the reviewer coding workbook (.xlsx) that matches Reviewer Workbook.docx."""
+import sys
+from openpyxl import Workbook
+from openpyxl.comments import Comment
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
+
+FIRST, LAST = 3, 403          # data rows
+PILOT = 40                    # pre-numbered rows
+
+LISTS = {
+    "YESNO": ["Yes", "No"],
+    "YNC": ["Yes", "No", "Cannot tell"],
+    "VITALS": ["All documented", "Partly documented", "None documented"],
+    "EXAM": ["None documented", "General appearance only", "Systems documented"],
+    "INV": ["None", "Laboratory only", "Imaging only", "Laboratory and imaging"],
+    "DISCH": ["None documented", "Generic advice only", "Specific return precautions"],
+    "FU": ["None documented", "Return to ED", "Outpatient clinic", "Primary health centre", "Other"],
+    "ADEQ": ["Adequate", "Inadequate", "Cannot tell from the record"],
+    "DISP": ["Discharged", "Admitted", "Transferred", "Died"],
+    "ELIG": ["1 eligible", "2 scheduled", "3 administrative", "4 insufficient documentation",
+             "5 not discharged - tell the PI"],
+    "REL": ["1 related", "2 unrelated", "3 uncertain"],
+    "ATT": ["1 illness-related", "2 patient-related", "3 physician-related", "4 uncertain"],
+    "PRV": ["1 preventable", "2 not preventable", "3 uncertain"],
+    "ACC": ["1 yes", "2 no", "3 uncertain"],
+    "ACCT": ["No clinic appointment available", "Could not reach clinic",
+             "Could not obtain the medicine", "Cost", "Other"],
+    # Basis pointers. The reviewer names the field that drove the judgement -
+    # they never retype its contents, which are already recorded to the left.
+    "FIELD": ["I-1", "I-2", "I-3", "I-4", "R-1", "R-2", "R-3", "R-4",
+              "more than one", "none fit"],
+    "FIELD9": ["R-3", "R-4", "both", "none - nothing documented"],
+}
+
+SECT = {
+    "ADMIN": "D9D9D9",
+    "INDEX VISIT \u2014 what only a reader can tell (Step 2)": "DEE7F0",
+    "INDEX JUDGEMENT \u2014 lock before opening the return (Step 3)": "FFF2CC",
+    "RETURN VISIT \u2014 what only a reader can tell (Step 4)": "E2EFDA",
+    "JUDGEMENTS (Steps 5 to 9)": "FCE4D6",
+    "CLOSE (Step 10)": "D9D9D9",
+}
+
+IDX = "INDEX VISIT \u2014 what only a reader can tell (Step 2)"
+LOCK = "INDEX JUDGEMENT \u2014 lock before opening the return (Step 3)"
+RET = "RETURN VISIT \u2014 what only a reader can tell (Step 4)"
+
+# (section, header, width, list-key or None, comment or None)
+# Nothing here duplicates the IT export: arrival and discharge times, diagnoses,
+# medications, investigations and disposition all come from the export and are
+# never retyped by a reviewer.
+COLS = [
+ ("ADMIN", "Pair no.", 7, None, None),
+ ("ADMIN", "Study ID", 9, None, None),
+ ("ADMIN", "Your entries so far - READ ONLY", 42, None,
+  "This cell fills itself from the columns to the right. It is frozen, so it stays on screen "
+  "however far you scroll. Do not type here - if a value looks wrong, correct it in its own column."),
+ ("ADMIN", "Reviewer", 11, None, None),
+ ("ADMIN", "Date of review", 12, None, None),
+
+ (IDX, "I-1 Vital signs documented", 14, "VITALS",
+  "Were vital signs written in the index record? Partly means some but not all. This is about what was RECORDED, not whether it was normal."),
+ (IDX, "I-2 Relevant system examined?", 15, "YNC",
+  "Was the body system relevant to the complaint examined and documented? A limp with no hip examination is not the same case as a hip examined and recorded normal. This field decides Step 7 more often than any other."),
+ (IDX, "I-3 Discharge instructions", 17, "DISCH",
+  "Specific means documented return precautions: what to watch for, and when to come back."),
+ (IDX, "I-4 Follow-up directed to", 17, "FU",
+  "Where was the family told to go? Without this, Step 9 has no context."),
+
+ (LOCK, "Was the discharge decision reasonable?", 17, "ADEQ",
+  "Answer BEFORE opening the return visit. Do not change it afterwards."),
+ (LOCK, "Step 3 Basis - field", 10, "FIELD",
+  "Which field drove your answer? Pick it from the list - do not type it. "
+  "If more than one field drove it, choose 'more than one' and name them in the reason."),
+ (LOCK, "Step 3 Basis - reason", 30, None,
+  "One short line of reasoning. Do NOT copy the contents of the field - it is already recorded "
+  "to the left and the analysis links to it through the pointer. "
+  "Good: hip not examined anywhere in the note. Bad: looked fine - that is not a reason."),
+ (LOCK, "Initials + date locked", 13, None,
+  "Your initials and today's date, for example: W.Q. 2026-09-14. This records that you decided BEFORE "
+  "opening the return visit. Nothing stops you editing it later - it is an agreement, not a lock. "
+  "If you change your mind after Step 4, leave this alone and explain in the Step 10 note."),
+
+ (RET, "R-1 Reason for return - exact words", 34, None,
+  "Copy the exact words of the family or the nurse. Do not shorten them or turn them into a conclusion. If the note is in Arabic, copy the Arabic. This column becomes the reasons table in the paper."),
+ (RET, "R-2 Diagnosis different from index?", 14, "YESNO",
+  "A clinical judgement, not a text comparison. Fever then pneumonia is the same illness better characterised."),
+ (RET, "R-3 Access statement - exact words", 34, None,
+  "Appointment, transport, distance, checkpoint, cost, medicine not obtained. Choose or type: None documented, if there is nothing."),
+ (RET, "R-4 Medicine statement - exact words", 30, None,
+  "Type: None documented, if there is nothing."),
+
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 5 Eligibility", 20, "ELIG",
+  "If this is not 1 eligible, leave Steps 6 to 9 blank."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 6 Relatedness", 15, "REL",
+  "Is it the SAME PROBLEM? If unrelated, leave Step 7 blank."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 6 Basis - field", 10, "FIELD",
+  "Pointer only - which field showed you this is the same problem, or a different one. "
+  "No reason needed here: relatedness is rarely contested, and the field is enough to check it."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 7 Attribution", 17, "ATT",
+  "WHY did the child come back? A different question from Step 6. Judge only on what was documented at the index visit, never with hindsight."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 7 Basis - field", 10, "FIELD",
+  "Which field drove the attribution? Pick it, do not type it."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 7 Basis - reason", 30, None,
+  "This is the judgement the paper turns on, so it keeps a written reason. One short line. "
+  "Illness-related example: chest examined and clear, pneumonia not detectable then. "
+  "Physician-related example: chest never examined. Do not copy the field contents."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 8 Preventability", 15, "PRV",
+  "Not the same as physician-related. A misunderstanding may be preventable by clearer instructions and still be patient-related."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 8 Basis - field", 10, "FIELD",
+  "Pointer only - which field, if any, could have changed the outcome. "
+  "The reasoning overlaps with Step 7, which already carries a written reason."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 9 Access barrier", 13, "ACC",
+  "Code 1 yes only on documented evidence. If the record is silent, code 2 no, not 3 uncertain."),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 9 Barrier type", 20, "ACCT", None),
+ ("JUDGEMENTS (Steps 5 to 9)", "Step 9 Basis - field", 12, "FIELD9",
+  "Pointer only. The words themselves are already in R-3 or R-4 - never retype them here. "
+  "If you coded 2 no, choose: none - nothing documented."),
+
+ ("CLOSE (Step 10)", "Note for Dr Amani", 30, None, None),
+ ("CLOSE (Step 10)", "Workbook covered this pair?", 13, "YESNO",
+  "No means the workbook did not tell you how to handle it. These cases are what corrects the "
+  "workbook after the pilot - they are valuable, not a nuisance."),
+ ("CLOSE (Step 10)", "Did you recognise the child?", 13, "YESNO",
+  "Yes = you recognised the child or worked out who treated them. Hand it to Dr Amani Salman."),
+]
+
+HDR = {c[1]: i + 1 for i, c in enumerate(COLS)}
+def L(name):
+    return get_column_letter(HDR[name])
+
+THIN = Side(style="thin", color="B0B0B0")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+RED = PatternFill("solid", fgColor="FFC7CE")
+AMBER = PatternFill("solid", fgColor="FFD966")
+
+
+def instructions(ws, reviewer, banner=None):
+    ws.column_dimensions["A"].width = 4
+    ws.column_dimensions["B"].width = 104
+    rows = [
+        ("H1", "Coding sheet — %s" % reviewer),
+        ("", ""),
+        ("B", "\u0627\u0644\u062a\u0639\u0644\u064a\u0645\u0627\u062a \u0628\u0627\u0644\u0639\u0631\u0628\u064a\u0629 \u0641\u064a \u0627\u0644\u0648\u0631\u0642\u0629 \u0627\u0644\u062a\u0627\u0644\u064a\u0629   \u2014   Arabic instructions are on the next tab."),
+        ("", ""),
+        ("H2", "Before you start"),
+        ("", "Work from Reviewer Workbook.docx. This sheet is one row per pair, and it deliberately asks for very little. Everything the hospital system already holds - arrival and discharge times, diagnoses, medications, investigations, disposition - comes from the IT export and is never retyped here. You record only what a person has to read the notes to know."),
+        ("", ""),
+        ("B", "1. This file is yours alone. Do not open, send, or compare it with the other reviewer's file until Dr Amani Salman has settled the disagreements. Independence is what makes the agreement statistic mean anything."),
+        ("B", "2. Fill the columns left to right. That order is deliberate: the index visit and your locked index judgement come before the return visit columns, so that you judge the discharge decision before you know how the story ended."),
+        ("B", "3. Never leave a cell blank. If nothing is written in the chart, choose None documented, or type None documented in the free-text columns. Blank cells turn red. Not documented is not the same as normal, and this is the rule the whole study rests on."),
+        ("B", "4. Every judgement asks which field drove it. PICK the field from the dropdown - never type the code. Only Step 3 and Step 7 also ask for a written reason; Steps 6, 8 and 9 need the pointer alone."),
+        ("B", "5. NEVER copy the contents of a field into a Basis reason. What you wrote in R-1 or R-3 stays there, and the pointer is how it is found again. Writing it twice creates two versions that can disagree."),
+        ("B", "6. Column C fills itself and stays on screen wherever you scroll. It shows I-2, I-3, R-2, whether R-3 has anything in it, and the start of R-1 - so you never have to scroll back to check what you entered. Do not type in column C."),
+        ("B", "7. The three exact-words columns are copied straight from the record. Do not shorten them, tidy them, or put them in your own words. If the note is in Arabic, copy the Arabic - translation happens later, once, with the original kept beside it."),
+        ("B", "8. Grey and coloured cells with a small red corner have a note. Hover over them."),
+        ("", ""),
+        ("H2", "Field numbers - use these in every Basis"),
+        ("B", "I-1 Vital signs documented          R-1 Reason for return, exact words"),
+        ("B", "I-2 Relevant system examined        R-2 Return diagnosis different from index"),
+        ("B", "I-3 Discharge instructions          R-3 Access statement, exact words"),
+        ("B", "I-4 Follow-up directed to           R-4 Medicine statement, exact words"),
+        ("B", "These eight are the only facts you record yourself. Every Basis cell starts with one of them. If your reason fits none of them, say so in the Step 10 note."),
+        ("", ""),
+        ("H2", "What the colours mean"),
+        ("B", "Red cell — something required is missing, or a rule has been broken."),
+        ("B", "Amber cell — a judgement has been entered that should be blank, for example an attribution on a return you coded unrelated."),
+        ("", ""),
+        ("H2", "What you do not have to enter"),
+        ("B", "Times, ages, diagnoses, medications and the 72-hour gap. All of it is computed centrally from the export."),
+        ("", ""),
+        ("H2", "When you finish"),
+        ("B", "Send the file to the PI. Nothing else is needed to produce the reliability analysis."),
+        ("", ""),
+        ("H2", "Nothing identifiable leaves institutional equipment"),
+        ("B", "Use the study ID, never the patient's name or hospital number. This file stays on hospital equipment."),
+    ]
+    if banner:
+        rows.insert(2, ("WARN", banner))
+    r = 2
+    for kind, text in rows:
+        c = ws.cell(row=r, column=2, value=text)
+        if kind == "H1":
+            c.font = Font(name="Aptos", size=16, bold=True, color="17365D")
+        elif kind == "WARN":
+            c.font = Font(name="Aptos", size=12, bold=True, color="C00000")
+            c.fill = PatternFill("solid", fgColor="FFF2F2")
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r].height = 34
+        elif kind == "H2":
+            c.font = Font(name="Aptos", size=12, bold=True, color="2F5597")
+        else:
+            c.font = Font(name="Aptos", size=10.5)
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            ws.row_dimensions[r].height = 30 if len(text) > 110 else 15
+        r += 1
+
+
+
+# Names are deliberately NOT transliterated into Arabic here; roles are used instead,
+# so that no colleague's name is misspelled. The Latin name appears once, in the title.
+AR_ROLE = {
+    "Reviewer 1": ("Dr Waad", "\u0627\u0644\u0645\u0631\u0627\u062c\u0650\u0639 \u0627\u0644\u0623\u0648\u0644"),
+    "Reviewer 2": ("Dr Ainaa", "\u0627\u0644\u0645\u0631\u0627\u062c\u0650\u0639 \u0627\u0644\u062b\u0627\u0646\u064a"),
+}
+
+
+def instructions_ar(ws, reviewer, banner=None):
+    """Right-to-left Arabic version of the instructions sheet."""
+    ws.sheet_view.rightToLeft = True
+    ws.column_dimensions["A"].width = 4
+    ws.column_dimensions["B"].width = 104
+
+    name, role = AR_ROLE.get(reviewer, (reviewer, reviewer))
+    rows = [
+        ("H1", "\u0648\u0631\u0642\u0629 \u0627\u0644\u062a\u0631\u0645\u064a\u0632 \u2014 %s (%s)" % (role, name)),
+        ("", ""),
+        ("H2", "\u0642\u0628\u0644 \u0623\u0646 \u062a\u0628\u062f\u0623"),
+        ("", "\u0627\u0633\u062a\u062e\u062f\u0645 \u0645\u0644\u0641 Reviewer Workbook \u0643\u0645\u0631\u062c\u0639. \u0647\u0630\u0647 \u0627\u0644\u0648\u0631\u0642\u0629 \u0633\u0637\u0631 \u0648\u0627\u062d\u062f \u0644\u0643\u0644 \u062d\u0627\u0644\u0629\u060c \u0648\u062a\u0637\u0644\u0628 \u0645\u0646\u0643 \u0627\u0644\u0642\u0644\u064a\u0644 \u0639\u0646 \u0642\u0635\u062f. \u0643\u0644 \u0645\u0627 \u064a\u062d\u0641\u0638\u0647 \u0646\u0638\u0627\u0645 \u0627\u0644\u0645\u0633\u062a\u0634\u0641\u0649 \u2014 \u0623\u0648\u0642\u0627\u062a \u0627\u0644\u062f\u062e\u0648\u0644 \u0648\u0627\u0644\u062e\u0631\u0648\u062c\u060c \u0648\u0627\u0644\u062a\u0634\u062e\u064a\u0635\u060c \u0648\u0627\u0644\u0623\u062f\u0648\u064a\u0629\u060c \u0648\u0627\u0644\u0641\u062d\u0648\u0635\u0627\u062a\u060c \u0648\u0645\u0622\u0644 \u0627\u0644\u0645\u0631\u064a\u0636 \u2014 \u064a\u0623\u062a\u064a \u0645\u0646 \u062a\u0635\u062f\u064a\u0631 \u0642\u0633\u0645 \u0627\u0644\u062d\u0627\u0633\u0648\u0628\u060c \u0648\u0644\u0627 \u064a\u064f\u0639\u0627\u062f \u0643\u062a\u0627\u0628\u062a\u0647 \u0647\u0646\u0627. \u0623\u0646\u062a \u062a\u0633\u062c\u0651\u0644 \u0641\u0642\u0637 \u0645\u0627 \u0644\u0627 \u064a\u064f\u0639\u0631\u0641 \u0625\u0644\u0627 \u0628\u0642\u0631\u0627\u0621\u0629 \u0627\u0644\u0645\u0644\u0627\u062d\u0638\u0627\u062a."),
+        ("", ""),
+        ("B", "\u0661. \u0647\u0630\u0627 \u0627\u0644\u0645\u0644\u0641 \u0644\u0643 \u0648\u062d\u062f\u0643. \u0644\u0627 \u062a\u0641\u062a\u062d\u0647 \u0623\u0648 \u062a\u0631\u0633\u0644\u0647 \u0623\u0648 \u062a\u0642\u0627\u0631\u0646\u0647 \u0628\u0645\u0644\u0641 \u0627\u0644\u0645\u0631\u0627\u062c\u0650\u0639 \u0627\u0644\u0622\u062e\u0631 \u0642\u0628\u0644 \u0623\u0646 \u064a\u062d\u0633\u0645 \u0627\u0644\u0645\u0631\u0627\u062c\u0650\u0639 \u0627\u0644\u062b\u0627\u0644\u062b \u0627\u0644\u0627\u062e\u062a\u0644\u0627\u0641\u0627\u062a. \u0627\u0644\u0627\u0633\u062a\u0642\u0644\u0627\u0644\u064a\u0629 \u0647\u064a \u0645\u0627 \u064a\u064f\u0639\u0637\u064a \u0646\u0633\u0628\u0629 \u0627\u0644\u0627\u062a\u0641\u0627\u0642 \u0645\u0639\u0646\u0627\u0647\u0627."),
+        ("B", "\u0662. \u0639\u0628\u0651\u0626 \u0627\u0644\u0623\u0639\u0645\u062f\u0629 \u0628\u0627\u0644\u062a\u0631\u062a\u064a\u0628\u060c \u0645\u0646 \u0627\u0644\u0639\u0645\u0648\u062f \u0627\u0644\u0623\u0648\u0644 \u0625\u0644\u0649 \u0627\u0644\u0623\u062e\u064a\u0631. \u0627\u0644\u062a\u0631\u062a\u064a\u0628 \u0645\u0642\u0635\u0648\u062f: \u0632\u064a\u0627\u0631\u0629 \u0627\u0644\u0628\u062f\u0627\u064a\u0629 \u0648\u062d\u0643\u0645\u0643 \u0639\u0644\u064a\u0647\u0627 \u064a\u0623\u062a\u064a\u0627\u0646 \u0642\u0628\u0644 \u0623\u0639\u0645\u062f\u0629 \u0632\u064a\u0627\u0631\u0629 \u0627\u0644\u0631\u062c\u0648\u0639\u060c \u062d\u062a\u0649 \u062a\u062d\u0643\u0645 \u0639\u0644\u0649 \u0642\u0631\u0627\u0631 \u0627\u0644\u062e\u0631\u0648\u062c \u0642\u0628\u0644 \u0623\u0646 \u062a\u0639\u0631\u0641 \u0643\u064a\u0641 \u0627\u0646\u062a\u0647\u062a \u0627\u0644\u0642\u0635\u0629."),
+        ("B", "\u0663. \u0644\u0627 \u062a\u062a\u0631\u0643 \u0623\u064a \u062e\u0627\u0646\u0629 \u0641\u0627\u0631\u063a\u0629. \u0625\u0630\u0627 \u0644\u0645 \u064a\u0643\u0646 \u0647\u0646\u0627\u0643 \u0634\u064a\u0621 \u0645\u0643\u062a\u0648\u0628 \u0641\u064a \u0627\u0644\u0645\u0644\u0641\u060c \u0627\u062e\u062a\u0631 None documented \u0623\u0648 \u0627\u0643\u062a\u0628\u0647\u0627 \u0641\u064a \u062e\u0627\u0646\u0627\u062a \u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0631. \u0627\u0644\u062e\u0627\u0646\u0629 \u0627\u0644\u0641\u0627\u0631\u063a\u0629 \u062a\u0635\u0628\u062d \u062d\u0645\u0631\u0627\u0621. \u063a\u064a\u0631 \u0645\u0648\u062b\u0651\u0642 \u0644\u064a\u0633 \u0643\u0637\u0628\u064a\u0639\u064a\u060c \u0648\u0647\u0630\u0647 \u0627\u0644\u0642\u0627\u0639\u062f\u0629 \u062a\u0642\u0648\u0645 \u0639\u0644\u064a\u0647\u0627 \u0627\u0644\u062f\u0631\u0627\u0633\u0629 \u0643\u0644\u0647\u0627."),
+        ("B", "\u0664. \u0643\u0644 \u062d\u0643\u0645 \u064a\u0633\u0623\u0644 \u0639\u0646 \u0627\u0644\u062d\u0642\u0644 \u0627\u0644\u0630\u064a \u0628\u064f\u0646\u064a \u0639\u0644\u064a\u0647. \u0627\u062e\u062a\u0631 \u0627\u0644\u062d\u0642\u0644 \u0645\u0646 \u0627\u0644\u0642\u0627\u0626\u0645\u0629 \u0627\u0644\u0645\u0646\u0633\u062f\u0644\u0629 \u0648\u0644\u0627 \u062a\u0643\u062a\u0628 \u0627\u0644\u0631\u0645\u0632 \u0628\u064a\u062f\u0643. \u0627\u0644\u062e\u0637\u0648\u062a\u0627\u0646 \u0663 \u0648 \u0667 \u0641\u0642\u0637 \u062a\u0637\u0644\u0628\u0627\u0646 \u0633\u0628\u0628\u064b\u0627 \u0645\u0643\u062a\u0648\u0628\u064b\u0627\u061b \u0623\u0645\u0627 \u0666 \u0648 \u0668 \u0648 \u0669 \u0641\u064a\u0643\u0641\u064a\u0647\u0627 \u0627\u062e\u062a\u064a\u0627\u0631 \u0627\u0644\u062d\u0642\u0644."),
+        ("B", "\u0665. \u0644\u0627 \u062a\u0646\u0642\u0644 \u0645\u062d\u062a\u0648\u0649 \u0623\u064a \u062d\u0642\u0644 \u0625\u0644\u0649 \u062e\u0627\u0646\u0629 \u0627\u0644\u0633\u0628\u0628. \u0645\u0627 \u0643\u062a\u0628\u062a\u0647 \u0641\u064a R-1 \u0623\u0648 R-3 \u064a\u0628\u0642\u0649 \u0645\u0643\u0627\u0646\u0647\u060c \u0648\u0627\u0644\u0645\u0624\u0634\u0631 \u0647\u0648 \u0637\u0631\u064a\u0642\u0629 \u0627\u0644\u0648\u0635\u0648\u0644 \u0625\u0644\u064a\u0647. \u0643\u062a\u0627\u0628\u062a\u0647 \u0645\u0631\u062a\u064a\u0646 \u062a\u0646\u0634\u0626 \u0646\u0633\u062e\u062a\u064a\u0646 \u0642\u062f \u062a\u062e\u062a\u0644\u0641\u0627\u0646."),
+        ("B", "\u0666. \u0627\u0644\u0639\u0645\u0648\u062f C \u064a\u0645\u062a\u0644\u0626 \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u0648\u064a\u0628\u0642\u0649 \u0638\u0627\u0647\u0631\u064b\u0627 \u0623\u064a\u0646\u0645\u0627 \u062a\u0645\u0631\u0651\u0631 \u0627\u0644\u0634\u0627\u0634\u0629. \u064a\u0639\u0631\u0636 I-2 \u0648 I-3 \u0648 R-2 \u0648\u0647\u0644 \u0641\u064a R-3 \u0634\u064a\u0621\u060c \u0648\u0628\u062f\u0627\u064a\u0629 R-1 \u2014 \u062d\u062a\u0649 \u0644\u0627 \u062a\u0636\u0637\u0631 \u0644\u0644\u0631\u062c\u0648\u0639 \u0644\u0644\u062e\u0644\u0641. \u0644\u0627 \u062a\u0643\u062a\u0628 \u0641\u064a \u0627\u0644\u0639\u0645\u0648\u062f C."),
+        ("B", "\u0667. \u0623\u0639\u0645\u062f\u0629 \u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0631\u0641\u064a \u0627\u0644\u062b\u0644\u0627\u062b\u0629 \u062a\u064f\u0646\u0642\u0644 \u0643\u0645\u0627 \u0647\u064a \u0645\u0646 \u0627\u0644\u0645\u0644\u0641. \u0644\u0627 \u062a\u062e\u062a\u0635\u0631\u0647\u0627 \u0648\u0644\u0627 \u062a\u0631\u062a\u0651\u0628\u0647\u0627 \u0648\u0644\u0627 \u062a\u0643\u062a\u0628\u0647\u0627 \u0628\u0623\u0633\u0644\u0648\u0628\u0643. \u0625\u0630\u0627 \u0643\u0627\u0646\u062a \u0627\u0644\u0645\u0644\u0627\u062d\u0638\u0629 \u0628\u0627\u0644\u0639\u0631\u0628\u064a\u0629\u060c \u0627\u0646\u0642\u0644\u0647\u0627 \u0628\u0627\u0644\u0639\u0631\u0628\u064a\u0629 \u2014 \u0627\u0644\u062a\u0631\u062c\u0645\u0629 \u062a\u062a\u0645 \u0644\u0627\u062d\u0642\u064b\u0627 \u0645\u0631\u0629 \u0648\u0627\u062d\u062f\u0629 \u0645\u0639 \u0627\u0644\u0627\u062d\u062a\u0641\u0627\u0638 \u0628\u0627\u0644\u0623\u0635\u0644."),
+        ("B", "\u0668. \u0627\u0644\u062e\u0627\u0646\u0627\u062a \u0627\u0644\u0631\u0645\u0627\u062f\u064a\u0629 \u0648\u0627\u0644\u0645\u0644\u0648\u0651\u0646\u0629 \u0627\u0644\u062a\u064a \u0641\u064a \u0632\u0627\u0648\u064a\u062a\u0647\u0627 \u0639\u0644\u0627\u0645\u0629 \u062d\u0645\u0631\u0627\u0621 \u0635\u063a\u064a\u0631\u0629 \u0639\u0644\u064a\u0647\u0627 \u0645\u0644\u0627\u062d\u0638\u0629. \u0645\u0631\u0651\u0631 \u0627\u0644\u0645\u0624\u0634\u0631 \u0641\u0648\u0642\u0647\u0627."),
+        ("", ""),
+        ("H2", "\u0627\u0633\u0645 \u0627\u0644\u0637\u0628\u064a\u0628 \u0627\u0644\u0645\u0639\u0627\u0644\u062c \u0645\u062e\u0641\u064a"),
+        ("B", "\u0627\u0633\u0645 \u0627\u0644\u0637\u0628\u064a\u0628 \u0627\u0644\u0630\u064a \u0631\u0623\u0649 \u0627\u0644\u0637\u0641\u0644 \u064a\u064f\u062d\u0630\u0641 \u0645\u0646 \u0627\u0644\u0645\u0644\u0641\u0627\u062a \u0642\u0628\u0644 \u0623\u0646 \u062a\u0635\u0644\u0643. \u0647\u0630\u0627 \u0645\u0642\u0635\u0648\u062f: \u0623\u0646\u062a \u062a\u062d\u0643\u0645 \u0647\u0644 \u0643\u0627\u0646 \u0642\u0631\u0627\u0631 \u0627\u0644\u062e\u0631\u0648\u062c \u0645\u0639\u0642\u0648\u0644\u064b\u0627\u060c \u0648\u0647\u0630\u0627 \u0627\u0644\u062d\u0643\u0645 \u064a\u062c\u0628 \u0623\u0644\u0627 \u064a\u0639\u062a\u0645\u062f \u0639\u0644\u0649 \u0645\u0646 \u0627\u062a\u062e\u0630\u0647. \u0625\u0630\u0627 \u0639\u0631\u0641\u062a \u0627\u0644\u062d\u0627\u0644\u0629 \u0635\u062f\u0641\u0629\u060c \u0644\u0627 \u062a\u062e\u0645\u0651\u0646 \u0648\u0644\u0627 \u062a\u0633\u0623\u0644 \u2014 \u0633\u062c\u0651\u0644\u0647\u0627 \u0641\u064a \u0627\u0644\u062e\u0637\u0648\u0629 10 \u0648\u0633\u0644\u0651\u0645 \u0627\u0644\u062d\u0627\u0644\u0629 \u0644\u0644\u0645\u0631\u0627\u062c\u0650\u0639 \u0627\u0644\u062b\u0627\u0644\u062b."),
+        ("", ""),
+        ("H2", "\u0623\u0631\u0642\u0627\u0645 \u0627\u0644\u062d\u0642\u0648\u0644 \u2014 \u0627\u0633\u062a\u062e\u062f\u0645\u0647\u0627 \u0641\u064a \u0643\u0644 \u062e\u0627\u0646\u0629 \u0623\u0633\u0627\u0633"),
+        ("B", "I-1 \u0627\u0644\u0639\u0644\u0627\u0645\u0627\u062a \u0627\u0644\u062d\u064a\u0648\u064a\u0629 \u0627\u0644\u0645\u0648\u062b\u0651\u0642\u0629          R-1 \u0633\u0628\u0628 \u0627\u0644\u0631\u062c\u0648\u0639 \u0628\u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0631\u0641\u064a"),
+        ("B", "I-2 \u0641\u062d\u0635 \u0627\u0644\u062c\u0647\u0627\u0632 \u0630\u064a \u0627\u0644\u0635\u0644\u0629          R-2 \u0627\u062e\u062a\u0644\u0627\u0641 \u062a\u0634\u062e\u064a\u0635 \u0627\u0644\u0631\u062c\u0648\u0639 \u0639\u0646 \u0627\u0644\u0623\u0648\u0644"),
+        ("B", "I-3 \u062a\u0639\u0644\u064a\u0645\u0627\u062a \u0627\u0644\u062e\u0631\u0648\u062c          R-3 \u0630\u0643\u0631 \u0635\u0639\u0648\u0628\u0629 \u0627\u0644\u0648\u0635\u0648\u0644 \u0628\u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0631\u0641\u064a"),
+        ("B", "I-4 \u062c\u0647\u0629 \u0627\u0644\u0645\u062a\u0627\u0628\u0639\u0629          R-4 \u0630\u0643\u0631 \u0627\u0644\u062f\u0648\u0627\u0621 \u0628\u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0631\u0641\u064a"),
+        ("B", "\u0647\u0630\u0647 \u0627\u0644\u062d\u0642\u0648\u0644 \u0627\u0644\u062b\u0645\u0627\u0646\u064a\u0629 \u0647\u064a \u0627\u0644\u0648\u062d\u064a\u062f\u0629 \u0627\u0644\u062a\u064a \u062a\u0633\u062c\u0651\u0644\u0647\u0627 \u0628\u0646\u0641\u0633\u0643. \u0643\u0644 \u062e\u0627\u0646\u0629 \u0623\u0633\u0627\u0633 \u062a\u0628\u062f\u0623 \u0628\u0648\u0627\u062d\u062f \u0645\u0646\u0647\u0627."),
+        ("", ""),
+        ("H2", "\u0645\u0627\u0630\u0627 \u062a\u0639\u0646\u064a \u0627\u0644\u0623\u0644\u0648\u0627\u0646"),
+        ("B", "\u062e\u0627\u0646\u0629 \u062d\u0645\u0631\u0627\u0621 \u2014 \u0634\u064a\u0621 \u0645\u0637\u0644\u0648\u0628 \u0646\u0627\u0642\u0635\u060c \u0623\u0648 \u0642\u0627\u0639\u062f\u0629 \u0644\u0645 \u062a\u064f\u062a\u0651\u0628\u0639."),
+        ("B", "\u062e\u0627\u0646\u0629 \u0628\u0631\u062a\u0642\u0627\u0644\u064a\u0629 \u2014 \u0643\u064f\u062a\u0628 \u062d\u0643\u0645 \u064a\u062c\u0628 \u0623\u0646 \u064a\u0628\u0642\u0649 \u0641\u0627\u0631\u063a\u064b\u0627\u060c \u0645\u062b\u0644 \u0633\u0628\u0628 \u0627\u0644\u0631\u062c\u0648\u0639 \u0641\u064a \u062d\u0627\u0644\u0629 \u0631\u0645\u0651\u0632\u062a\u0647\u0627 \u063a\u064a\u0631 \u0645\u0631\u062a\u0628\u0637\u0629."),
+        ("", ""),
+        ("H2", "\u0645\u0627 \u0644\u0627 \u062a\u062d\u062a\u0627\u062c \u0625\u0644\u0649 \u0625\u062f\u062e\u0627\u0644\u0647"),
+        ("B", "\u0627\u0644\u0623\u0648\u0642\u0627\u062a\u060c \u0648\u0627\u0644\u0623\u0639\u0645\u0627\u0631\u060c \u0648\u0627\u0644\u062a\u0634\u062e\u064a\u0635\u0627\u062a\u060c \u0648\u0627\u0644\u0623\u062f\u0648\u064a\u0629\u060c \u0648\u0641\u0627\u0631\u0642 \u0627\u0644\u0640 72 \u0633\u0627\u0639\u0629. \u0643\u0644\u0647\u0627 \u062a\u064f\u062d\u0633\u0628 \u0645\u0631\u0643\u0632\u064a\u064b\u0627 \u0645\u0646 \u0627\u0644\u062a\u0635\u062f\u064a\u0631."),
+        ("", ""),
+        ("H2", "\u0639\u0646\u062f \u0627\u0644\u0627\u0646\u062a\u0647\u0627\u0621"),
+        ("B", "\u0623\u0631\u0633\u0644 \u0627\u0644\u0645\u0644\u0641 \u0625\u0644\u0649 \u0627\u0644\u0628\u0627\u062d\u062b \u0627\u0644\u0631\u0626\u064a\u0633. \u0644\u0627 \u064a\u0644\u0632\u0645 \u0634\u064a\u0621 \u0622\u062e\u0631 \u0644\u0625\u062c\u0631\u0627\u0621 \u062a\u062d\u0644\u064a\u0644 \u0627\u0644\u0627\u062a\u0641\u0627\u0642."),
+        ("", ""),
+        ("H2", "\u0644\u0627 \u064a\u062e\u0631\u062c \u0645\u0646 \u0623\u062c\u0647\u0632\u0629 \u0627\u0644\u0645\u0633\u062a\u0634\u0641\u0649 \u0645\u0627 \u064a\u064f\u0639\u0631\u0651\u0641 \u0628\u0627\u0644\u0645\u0631\u064a\u0636"),
+        ("B", "\u0627\u0633\u062a\u062e\u062f\u0645 \u0631\u0642\u0645 \u0627\u0644\u062f\u0631\u0627\u0633\u0629\u060c \u0648\u0644\u064a\u0633 \u0627\u0633\u0645 \u0627\u0644\u0645\u0631\u064a\u0636 \u0623\u0648 \u0631\u0642\u0645\u0647 \u0641\u064a \u0627\u0644\u0645\u0633\u062a\u0634\u0641\u0649. \u064a\u0628\u0642\u0649 \u0647\u0630\u0627 \u0627\u0644\u0645\u0644\u0641 \u0639\u0644\u0649 \u062c\u0647\u0627\u0632 \u0627\u0644\u0645\u0633\u062a\u0634\u0641\u0649."),
+    ]
+
+    if banner:
+        rows.insert(2, ("WARN", banner))
+    r = 2
+    for kind, text in rows:
+        c = ws.cell(row=r, column=2, value=text)
+        if kind == "H1":
+            c.font = Font(name="Arial", size=16, bold=True, color="17365D")
+            c.alignment = Alignment(horizontal="right")
+        elif kind == "WARN":
+            c.font = Font(name="Arial", size=12, bold=True, color="C00000")
+            c.fill = PatternFill("solid", fgColor="FFF2F2")
+            c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="right")
+            ws.row_dimensions[r].height = 34
+        elif kind == "H2":
+            c.font = Font(name="Arial", size=12, bold=True, color="2F5597")
+            c.alignment = Alignment(horizontal="right")
+        else:
+            c.font = Font(name="Arial", size=11)
+            c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="right")
+            ws.row_dimensions[r].height = 34 if len(text) > 110 else 16
+        r += 1
+
+
+def build(path, reviewer, rows=None, n_rows=None, banner=None, banner_ar=None):
+    # rows   - list of {header: value} dicts pre-filled into the Pairs sheet.
+    #          Used only by the synthetic practice copies in REFERENCE/;
+    #          the real sheets in STEPS/ are always built empty.
+    # n_rows - how many data rows to lay out (default: the study's 401).
+    last = FIRST + n_rows - 1 if n_rows else LAST
+    wb = Workbook()
+    ws_i = wb.active
+    ws_i.title = "How to use"
+    instructions(ws_i, reviewer, banner)
+
+    ws_ar = wb.create_sheet("\u0627\u0644\u062a\u0639\u0644\u064a\u0645\u0627\u062a \u0628\u0627\u0644\u0639\u0631\u0628\u064a\u0629", 1)
+    instructions_ar(ws_ar, reviewer, banner_ar)
+
+    ws = wb.create_sheet("Pairs")
+    ws_c = wb.create_sheet("Codes")
+
+    # ---- code lists
+    for j, (key, vals) in enumerate(LISTS.items(), start=1):
+        ws_c.cell(row=1, column=j, value=key).font = Font(bold=True)
+        for i, v in enumerate(vals, start=2):
+            ws_c.cell(row=i, column=j, value=v)
+    ws_c.sheet_state = "hidden"
+    ref = {key: "Codes!$%s$2:$%s$%d" % (get_column_letter(j), get_column_letter(j), len(v) + 1)
+           for j, (key, v) in enumerate(LISTS.items(), start=1)}
+
+    # ---- section banner + header
+    col = 1
+    for section, color in SECT.items():
+        n = sum(1 for c in COLS if c[0] == section)
+        if not n:
+            continue
+        a, b = get_column_letter(col), get_column_letter(col + n - 1)
+        ws.merge_cells("%s1:%s1" % (a, b))
+        cell = ws["%s1" % a]
+        cell.value = section
+        cell.fill = PatternFill("solid", fgColor=color)
+        cell.font = Font(name="Aptos", size=10, bold=True, color="17365D")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        col += n
+
+    for j, (section, header, width, key, note) in enumerate(COLS, start=1):
+        c = ws.cell(row=2, column=j, value=header)
+        c.fill = PatternFill("solid", fgColor=SECT[section])
+        c.font = Font(name="Aptos", size=9, bold=True)
+        c.alignment = Alignment(wrap_text=True, vertical="bottom")
+        c.border = BORDER
+        ws.column_dimensions[get_column_letter(j)].width = width
+        if note:
+            c.comment = Comment(note, "Study protocol")
+        if key:
+            dv = DataValidation(type="list", formula1=ref[key], allow_blank=True, showDropDown=False)
+            dv.error = "Pick a value from the list."
+            dv.errorTitle = "Not a valid code"
+            ws.add_data_validation(dv)
+            dv.add("%s%d:%s%d" % (get_column_letter(j), FIRST, get_column_letter(j), last))
+    ws.row_dimensions[1].height = 20
+    ws.row_dimensions[2].height = 58
+
+    # ---- body
+    for r in range(FIRST, last + 1):
+        for j in range(1, len(COLS) + 1):
+            cell = ws.cell(row=r, column=j)
+            cell.border = BORDER
+            cell.font = Font(name="Aptos", size=10)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+        if rows is not None or r - FIRST < PILOT:
+            ws.cell(row=r, column=1, value=r - FIRST + 1)
+        ws.cell(row=r, column=HDR["Reviewer"], value=reviewer)
+        ctx = ws.cell(row=r, column=HDR["Your entries so far - READ ONLY"])
+        ctx.value = (
+            '=IF($A{r}="","",'
+            '"I2 "&{i2}{r}&" | I3 "&LEFT({i3}{r},9)&" | R2 "&{r2}{r}'
+            '&" | R3 "&IF({r3}{r}="","-","yes")&" | "&LEFT({r1}{r},24))'
+        ).format(r=r, i2=L("I-2 Relevant system examined?"),
+                 i3=L("I-3 Discharge instructions"),
+                 r2=L("R-2 Diagnosis different from index?"),
+                 r3=L("R-3 Access statement - exact words"),
+                 r1=L("R-1 Reason for return - exact words"))
+        ctx.fill = PatternFill("solid", fgColor="EDEDED")
+        ctx.font = Font(name="Aptos", size=9, italic=True, color="595959")
+        ctx.alignment = Alignment(wrap_text=False, vertical="top")
+        ws.row_dimensions[r].height = 30
+
+    ws.freeze_panes = "D3"   # pair no., study ID and the context cell stay on screen
+    ws.auto_filter.ref = "A2:%s%d" % (get_column_letter(len(COLS)), last)
+
+    # ---- conditional formatting
+    span = lambda name: "%s%d:%s%d" % (L(name), FIRST, L(name), last)
+    pair, elig = "$A%d" % FIRST, "$%s%d" % (L("Step 5 Eligibility"), FIRST)
+    rel = "$%s%d" % (L("Step 6 Relatedness"), FIRST)
+
+    # vitals and key facts must never be blank once a pair is started
+    for name in ["I-1 Vital signs documented", "I-2 Relevant system examined?", "I-3 Discharge instructions",
+                 "I-4 Follow-up directed to", "R-1 Reason for return - exact words",
+                 "R-3 Access statement - exact words", "R-4 Medicine statement - exact words"]:
+        f = 'AND(%s<>"",%s%d="")' % (pair, L(name), FIRST)
+        ws.conditional_formatting.add(span(name), FormulaRule(formula=[f], fill=RED, stopIfTrue=False))
+
+    # a judgement without its basis pointer (and, where required, its reason)
+    for jname, bname in [("Was the discharge decision reasonable?", "Step 3 Basis - field"),
+                         ("Was the discharge decision reasonable?", "Step 3 Basis - reason"),
+                         ("Step 6 Relatedness", "Step 6 Basis - field"),
+                         ("Step 7 Attribution", "Step 7 Basis - field"),
+                         ("Step 7 Attribution", "Step 7 Basis - reason"),
+                         ("Step 8 Preventability", "Step 8 Basis - field"),
+                         ("Step 9 Access barrier", "Step 9 Basis - field")]:
+        f = 'AND($%s%d<>"",%s%d="")' % (L(jname), FIRST, L(bname), FIRST)
+        ws.conditional_formatting.add(span(bname), FormulaRule(formula=[f], fill=RED, stopIfTrue=False))
+
+    # the gate rule: unrelated returns carry no attribution
+    ws.conditional_formatting.add(
+        span("Step 7 Attribution"),
+        FormulaRule(formula=['AND(%s="2 unrelated",%s%d<>"")'
+                             % (rel, L("Step 7 Attribution"), FIRST)],
+                    fill=AMBER, stopIfTrue=False))
+
+    # excluded pairs carry no judgements
+    for name in ["Step 6 Relatedness", "Step 7 Attribution", "Step 8 Preventability", "Step 9 Access barrier"]:
+        f = 'AND(%s<>"",%s<>"1 eligible",%s%d<>"")' % (elig, elig, L(name), FIRST)
+        ws.conditional_formatting.add(span(name), FormulaRule(formula=[f], fill=AMBER, stopIfTrue=False))
+
+    # access barrier coded yes with no type given
+    acc = "$%s%d" % (L("Step 9 Access barrier"), FIRST)
+    ws.conditional_formatting.add(
+        span("Step 9 Barrier type"),
+        FormulaRule(formula=['AND(%s="1 yes",%s%d="")' % (acc, L("Step 9 Barrier type"), FIRST)],
+                    fill=RED, stopIfTrue=False))
+
+    # ---- pre-filled practice data (REFERENCE copies only)
+    if rows:
+        for i, rec in enumerate(rows):
+            for header, value in rec.items():
+                if value in (None, ""):
+                    continue
+                ws.cell(row=FIRST + i, column=HDR[header], value=value)
+
+    wb.save(path)
+    return path
+
+
+if __name__ == "__main__":
+    out = sys.argv[1]
+    for n in (1, 2):
+        p = "%s/Reviewer %d - Coding Sheet.xlsx" % (out, n)
+        build(p, "Reviewer %d" % n)
+        print("built:", p)
+    print("columns:", len(COLS))
